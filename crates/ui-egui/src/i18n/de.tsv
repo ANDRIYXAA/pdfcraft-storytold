@@ -2439,3 +2439,4 @@ animation effects	Off	Aus
 	Line colour	Linienfarbe
 	Drag a point to reshape the line. Delete removes it.	Ziehe einen Punkt, um die Linie umzuformen. Mit Entf wird sie gelöscht.
 	This point could not be moved. Try a smaller move.	Dieser Punkt ließ sich nicht verschieben. Versuche eine kleinere Verschiebung.
+	Snap to points and lines (Alt skips it)	An Punkten und Linien einrasten (Alt überspringt es)

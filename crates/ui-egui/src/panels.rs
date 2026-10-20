@@ -430,7 +430,10 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         Some((i, objects.len(), objects.first()?.outline.clone()?))
     });
     if let Some((i, count, look)) = paths {
-        if let Some(style) = crate::object_ui::line_panel(ui, count, &look)
+        let mut snap = !app.views[i].objects.no_snap;
+        let styled = crate::object_ui::line_panel(ui, count, &look, &mut snap);
+        app.views[i].objects.no_snap = !snap;
+        if let Some(style) = styled
             && let Some(edit) = app.views[i].objects.style_edit(style)
         {
             app.apply_edit(edit);

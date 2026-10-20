@@ -26,6 +26,21 @@ pub(crate) struct ObjectSelection {
     input_blocked: bool,
     /// One point of the selected path being dragged.
     vertex: Option<VertexDrag>,
+    /// Snapping of dragged points and moved lines is off (the Edit panel's check box).
+    pub(crate) no_snap: bool,
+    /// What the drag in progress snaps to.
+    snapping: Option<Snapping>,
+}
+
+/// What a drag in progress snaps to: the points and edges of the other lines (page user space), and
+/// where the snap shifts the drag (screen points) with what it took, for drawing.
+struct Snapping {
+    points: Vec<[f64; 2]>,
+    edges: Vec<([f64; 2], [f64; 2])>,
+    /// The points that move with a dragged group.
+    moving: Vec<[f64; 2]>,
+    adjust: egui::Vec2,
+    snap: Option<crate::snap::Snap>,
 }
 
 /// A press on a point of the selected path, until the button is released.
@@ -66,6 +81,7 @@ impl ObjectSelection {
         self.pending = None;
         self.blocked_page = None;
         self.vertex = None;
+        self.snapping = None;
     }
 
     pub fn prepare(&mut self, doc: &Document, enabled: bool, ctx: &egui::Context) {
@@ -176,6 +192,88 @@ fn same_points(a: &EditableObject, b: &EditableObject) -> bool {
 /// A page user-space point on screen.
 fn point_screen(xf: &PageXform, info: &DocInfo, page: usize, p: [f64; 2]) -> Pos2 {
     xf.user_rect(info, page, [p[0] as f32, p[1] as f32, p[0] as f32, p[1] as f32]).min
+}
+
+/// More points than this among the other lines and snapping is left out: it would slow the drag.
+const MAX_SNAP_POINTS: usize = 20_000;
+const ORANGE: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x1F);
+
+/// The edges of a path: each point to the next, and the last to the first when it is closed.
+fn path_edges(outline: &PathOutline) -> Vec<([f64; 2], [f64; 2])> {
+    let mut edges: Vec<_> = outline.points.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+    if outline.closed
+        && outline.points.len() > 2
+        && let (Some(first), Some(last)) = (outline.points.first(), outline.points.last())
+    {
+        edges.push((*last, *first));
+    }
+    edges
+}
+
+/// What a drag snaps to, from the page's `objects`: the points and edges of every path that is not
+/// selected. For one dragged point (`dragged`) the other points of its own path count too, so it can
+/// line up with them; for a dragged group the points of the selected paths are the ones that move.
+fn collect_snapping(objects: &[EditableObject], selected: &[EditableObject], dragged: Option<usize>) -> Option<Snapping> {
+    let mut snapping = Snapping { points: Vec::new(), edges: Vec::new(), moving: Vec::new(), adjust: egui::Vec2::ZERO, snap: None };
+    for object in objects {
+        let Some(outline) = object.outline.as_ref().filter(|_| object.target.kind == ObjectKind::Path) else { continue };
+        if selected.iter().any(|s| s.target == object.target) {
+            match dragged {
+                Some(point) => {
+                    snapping.points.extend(outline.points.iter().enumerate().filter(|(i, _)| *i != point).map(|(_, p)| *p));
+                }
+                None => snapping.moving.extend(outline.points.iter().copied()),
+            }
+            continue;
+        }
+        snapping.points.extend(outline.points.iter().copied());
+        snapping.edges.extend(path_edges(outline));
+        if snapping.points.len() > MAX_SNAP_POINTS {
+            return None;
+        }
+    }
+    Some(snapping)
+}
+
+/// Snapping holds off while Alt is down, or when the panel's check box is off.
+fn snapping_on(s: &ObjectSelection, ui: &egui::Ui) -> bool {
+    !s.no_snap && !ui.input(|i| i.modifiers.alt)
+}
+
+/// Where the dragged point snaps to now: shifts `s.snapping`'s `adjust` and records what it took.
+fn refresh_vertex_snap(s: &mut ObjectSelection, ui: &egui::Ui, xf: &PageXform, info: &DocInfo, page: usize, drag: &VertexDrag) {
+    let on = snapping_on(s, ui) && drag.start.distance(drag.now) > 2.0;
+    let from = s.selected.first().and_then(|o| o.outline.as_ref()).and_then(|o| o.points.get(drag.point)).copied();
+    let (Some(from), Some(snapping)) = (from, s.snapping.as_mut()) else { return };
+    snapping.adjust = egui::Vec2::ZERO;
+    snapping.snap = None;
+    if !on {
+        return;
+    }
+    let candidate = point_screen(xf, info, page, from) + (drag.now - drag.start);
+    let points: Vec<Pos2> = snapping.points.iter().map(|q| point_screen(xf, info, page, *q)).collect();
+    let edges: Vec<(Pos2, Pos2)> = snapping.edges.iter().map(|(a, b)| (point_screen(xf, info, page, *a), point_screen(xf, info, page, *b))).collect();
+    if let Some(snap) = crate::snap::snap_point(candidate, &points, &edges) {
+        snapping.adjust = snap.pos - candidate;
+        snapping.snap = Some(snap);
+    }
+}
+
+/// Where the moved group snaps to now: one of its points onto a point of another line.
+fn refresh_move_snap(s: &mut ObjectSelection, ui: &egui::Ui, xf: &PageXform, info: &DocInfo, page: usize, gesture: &Gesture) {
+    let on = snapping_on(s, ui) && gesture.start.distance(gesture.now) > 3.0;
+    let Some(snapping) = s.snapping.as_mut() else { return };
+    snapping.adjust = egui::Vec2::ZERO;
+    snapping.snap = None;
+    if !on || snapping.moving.is_empty() {
+        return;
+    }
+    let moving: Vec<Pos2> = snapping.moving.iter().map(|q| point_screen(xf, info, page, *q)).collect();
+    let targets: Vec<Pos2> = snapping.points.iter().map(|q| point_screen(xf, info, page, *q)).collect();
+    if let Some((adjust, target)) = crate::snap::snap_move(&moving, gesture.now - gesture.start, &targets) {
+        snapping.adjust = adjust;
+        snapping.snap = Some(crate::snap::Snap { pos: target, kind: crate::snap::Kind::Point, targets: vec![target], guides: Vec::new() });
+    }
 }
 
 /// The point of the only selected path that `p` is on, if any.
@@ -313,15 +411,18 @@ fn input(s: &mut ObjectSelection, ui: &egui::Ui, resp: &egui::Response, xf: &Pag
             drag.now = p;
         }
         if down {
+            refresh_vertex_snap(s, ui, xf, info, page, &drag);
             s.vertex = Some(drag);
         } else {
             s.vertex = None;
+            // Released where the snap took it.
+            let snapped = s.snapping.take().map_or(egui::Vec2::ZERO, |sn| sn.adjust);
             if drag.start.distance(drag.now) > 2.0
                 && view.pending_edit.is_none()
                 && let [object] = s.selected.as_slice()
                 && let Some(from) = object.outline.as_ref().and_then(|o| o.points.get(drag.point)).copied()
             {
-                let (a, b) = (xf.screen_to_view(drag.start), xf.screen_to_view(drag.now));
+                let (a, b) = (xf.screen_to_view(drag.start), xf.screen_to_view(drag.now + snapped));
                 match doc.object_move_offset(page, [f64::from(b.0 - a.0), f64::from(b.1 - a.1)]) {
                     Ok(offset) => {
                         let to = [from[0] + offset[0], from[1] + offset[1]];
@@ -352,6 +453,7 @@ fn input(s: &mut ObjectSelection, ui: &egui::Ui, resp: &egui::Response, xf: &Pag
                 return false;
             }
             s.gesture = None;
+            let snapped = s.snapping.take().map_or(egui::Vec2::ZERO, |sn| sn.adjust);
             if gesture.marquee {
                 let area = Rect::from_two_pos(gesture.start, gesture.now).intersect(xf.rect);
                 if !gesture.additive {
@@ -386,13 +488,20 @@ fn input(s: &mut ObjectSelection, ui: &egui::Ui, resp: &egui::Response, xf: &Pag
                     s.clear();
                 }
             } else if gesture.start.distance(gesture.now) > 3.0 && view.pending_edit.is_none() {
-                let (a, b) = (xf.screen_to_view(gesture.start), xf.screen_to_view(gesture.now));
+                let (a, b) = (xf.screen_to_view(gesture.start), xf.screen_to_view(gesture.now + snapped));
                 match doc.object_move_offset(page, [f64::from(b.0 - a.0), f64::from(b.1 - a.1)]) {
                     Ok(offset) => view.pending_edit = Some(s.move_by(page, offset)),
                     Err(_) => s.notice = Some(tl!("These objects could not be moved. Select them again and try a smaller move.").into()),
                 }
             }
         } else {
+            // A group being moved snaps one of its points onto a point of another line.
+            if !gesture.marquee {
+                if s.snapping.is_none() {
+                    s.snapping = s.inventory(doc, page).ok().and_then(|objects| collect_snapping(&objects, &s.selected, None));
+                }
+                refresh_move_snap(s, ui, xf, info, page, &gesture);
+            }
             s.gesture = Some(gesture);
         }
         ui.ctx().set_cursor_icon(if gesture.marquee { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Move });
@@ -417,6 +526,8 @@ fn input(s: &mut ObjectSelection, ui: &egui::Ui, resp: &egui::Response, xf: &Pag
         && let Some(point) = near_point(s, xf, info, page, p)
     {
         s.vertex = Some(VertexDrag { point, start: p, now: p });
+        // The points and edges of the other lines this point can snap to.
+        s.snapping = s.inventory(doc, page).ok().and_then(|objects| collect_snapping(&objects, &s.selected, Some(point)));
         return true;
     }
     let objects = match s.inventory(doc, page) {
@@ -564,7 +675,8 @@ pub(crate) fn paint(painter: &egui::Painter, xf: &PageXform, page: usize, info: 
     if selection.page != Some(page) {
         return;
     }
-    let delta = selection.gesture.filter(|g| !g.marquee).map_or(egui::Vec2::ZERO, |g| g.now - g.start);
+    let adjust = selection.snapping.as_ref().map_or(egui::Vec2::ZERO, |sn| sn.adjust);
+    let delta = selection.gesture.filter(|g| !g.marquee).map_or(egui::Vec2::ZERO, |g| g.now - g.start + adjust);
     let mut union = Rect::NOTHING;
     let single = selection.selected.len() == 1;
     for object in &selection.selected {
@@ -575,7 +687,7 @@ pub(crate) fn paint(painter: &egui::Painter, xf: &PageXform, page: usize, info: 
             if let Some(drag) = selection.vertex
                 && let Some(point) = points.get_mut(drag.point)
             {
-                *point += drag.now - drag.start;
+                *point += drag.now - drag.start + adjust;
             }
             if outline.closed
                 && let Some(first) = points.first().copied()
@@ -597,6 +709,20 @@ pub(crate) fn paint(painter: &egui::Painter, xf: &PageXform, page: usize, info: 
         painter.rect_filled(rect, 0.0, BLUE.gamma_multiply(0.05));
         painter.rect_stroke(rect, 0.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Outside);
         union = union.union(rect);
+    }
+    // What the drag snapped to: a ring on each point it took (a square on an edge) and a dashed
+    // guide from each point it lined up with.
+    if let Some(snap) = selection.snapping.as_ref().and_then(|sn| sn.snap.as_ref()) {
+        for guide in &snap.guides {
+            painter.add(egui::Shape::dashed_line(guide, Stroke::new(1.0, ORANGE), 4.0, 3.0));
+        }
+        for target in &snap.targets {
+            if snap.kind == crate::snap::Kind::Edge {
+                painter.rect_stroke(Rect::from_center_size(*target, egui::vec2(9.0, 9.0)), 0.0, Stroke::new(1.5, ORANGE), egui::StrokeKind::Middle);
+            } else {
+                painter.circle_stroke(*target, 6.0, Stroke::new(1.5, ORANGE));
+            }
+        }
     }
     if selection.selected.len() > 1 && union.is_positive() {
         painter.rect_stroke(union.expand(4.0), 0.0, Stroke::new(1.0, BLUE.gamma_multiply(0.7)), egui::StrokeKind::Outside);
@@ -622,7 +748,7 @@ pub(crate) fn delete_key(ctx: &egui::Context, view: &mut DocView) {
 }
 
 /// The Edit panel for selected vector paths: line width and colour. Returns what was changed.
-pub(crate) fn line_panel(ui: &mut egui::Ui, count: usize, look: &PathOutline) -> Option<PathStyle> {
+pub(crate) fn line_panel(ui: &mut egui::Ui, count: usize, look: &PathOutline, snap: &mut bool) -> Option<PathStyle> {
     let mut style = PathStyle::default();
     crate::widgets::section_title(ui, if count == 1 { tl!("Line") } else { tl!("Lines") });
     ui.horizontal(|ui| {
@@ -650,6 +776,8 @@ pub(crate) fn line_panel(ui: &mut egui::Ui, count: usize, look: &PathOutline) ->
         }
     });
     ui.label(egui::RichText::new(tl!("Drag a point to reshape the line. Delete removes it.")).small().weak());
+    // Dragged points and moved lines snap to the points, lines and rows of other lines; Alt skips it.
+    ui.add(crate::widgets::checkbox(snap, tl!("Snap to points and lines (Alt skips it)")));
     (style != PathStyle::default()).then_some(style)
 }
 

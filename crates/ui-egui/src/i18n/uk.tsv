@@ -2465,3 +2465,4 @@ animation effects	Off	Вимкнено
 	Move line point	Перемістити точку лінії
 	Drag a point to reshape the line. Delete removes it.	Перетягніть точку, щоб змінити форму лінії. Delete видаляє її.
 	This point could not be moved. Try a smaller move.	Цю точку не вдалося перемістити. Спробуйте менше зміщення.
+	Snap to points and lines (Alt skips it)	Прилипати до точок і ліній (Alt вимикає)

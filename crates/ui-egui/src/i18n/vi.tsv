@@ -2696,3 +2696,4 @@ key	Space	Space
 	Format line	Định dạng đường
 	Format lines	Định dạng các đường
 	Move line point	Di chuyển điểm của đường
+	Snap to points and lines (Alt skips it)	Bám vào điểm và đường (giữ Alt để bỏ qua)
